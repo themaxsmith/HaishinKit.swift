@@ -60,7 +60,7 @@ class RTMPNWSocket: RTMPSocketCompatible {
         conn?.start(queue: queue)
         receiveLoop(conn!)
         if 0 < timeout {
-            outputQueue.asyncAfter(deadline: .now() + .seconds(timeout), execute: timeoutHandler)
+            inputQueue.asyncAfter(deadline: .now() + .seconds(timeout), execute: timeoutHandler)
         }
     }
 

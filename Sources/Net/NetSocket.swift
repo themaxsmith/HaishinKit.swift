@@ -27,7 +27,8 @@ open class NetSocket: NSObject {
         self?.didTimeout()
     }
     private lazy var buffer = [UInt8](repeating: 0, count: windowSizeC)
-    private lazy var outputQueue = DispatchQueue(label: "com.haishinkit.HaishinKit.NetSocket.output", qos: qualityOfService)
+    private var outputBuffer = [(data: Data, locked: UnsafeMutablePointer<UInt32>?)]()
+    private lazy var outputQueue = DispatchQueue(label: "com.haishinkit.HaishinKit.NetSocket.input", qos: qualityOfService)
 
     public func connect(withName: String, port: Int) {
         inputQueue.async {
@@ -45,14 +46,32 @@ open class NetSocket: NSObject {
     public func doOutput(data: Data, locked: UnsafeMutablePointer<UInt32>? = nil) -> Int {
         OSAtomicAdd64(Int64(data.count), &queueBytesOut)
         outputQueue.async {
-            data.withUnsafeBytes { (buffer: UnsafeRawBufferPointer) -> Void in
-                self.doOutputProcess(buffer.baseAddress?.assumingMemoryBound(to: UInt8.self), maxLength: data.count)
-            }
-            if locked != nil {
-                OSAtomicAnd32Barrier(0, locked!)
+            self.outputBuffer.append((data, locked))
+            if let outputStram = self.outputStream {
+                self.doOutput(outputStram)
             }
         }
         return data.count
+    }
+
+    final func doOutputFromURL(_ url: URL, length: Int) {
+        do {
+            let fileHandle: FileHandle = try FileHandle(forReadingFrom: url)
+            defer {
+                fileHandle.closeFile()
+            }
+            let endOfFile = Int(fileHandle.seekToEndOfFile())
+            for i in 0..<Int(endOfFile / length) {
+                fileHandle.seek(toFileOffset: UInt64(i * length))
+                doOutput(data: fileHandle.readData(ofLength: length), locked: nil)
+            }
+            let remain: Int = endOfFile % length
+            if 0 < remain {
+                doOutput(data: fileHandle.readData(ofLength: remain), locked: nil)
+            }
+        } catch let error as NSError {
+            logger.error("\(error)")
+        }
     }
 
     open func close() {
@@ -60,53 +79,6 @@ open class NetSocket: NSObject {
     }
 
     open func listen() {
-    }
-
-    final func doOutputFromURL(_ url: URL, length: Int) {
-        outputQueue.async {
-            do {
-                let fileHandle: FileHandle = try FileHandle(forReadingFrom: url)
-                defer {
-                    fileHandle.closeFile()
-                }
-                let endOfFile = Int(fileHandle.seekToEndOfFile())
-                for i in 0..<Int(endOfFile / length) {
-                    fileHandle.seek(toFileOffset: UInt64(i * length))
-                    self.doOutputProcess(fileHandle.readData(ofLength: length))
-                }
-                let remain: Int = endOfFile % length
-                if 0 < remain {
-                    self.doOutputProcess(fileHandle.readData(ofLength: remain))
-                }
-            } catch let error as NSError {
-                logger.error("\(error)")
-            }
-        }
-    }
-
-    final func doOutputProcess(_ data: Data) {
-        data.withUnsafeBytes { (buffer: UnsafeRawBufferPointer) -> Void in
-            doOutputProcess(buffer.baseAddress?.assumingMemoryBound(to: UInt8.self), maxLength: data.count)
-        }
-    }
-
-    final func doOutputProcess(_ buffer: UnsafePointer<UInt8>?, maxLength: Int) {
-        guard let buffer = buffer else {
-            return
-        }
-        var total: Int = 0
-        while total < maxLength {
-            guard let outputStream = outputStream else {
-                return
-            }
-            let length: Int = outputStream.write(buffer.advanced(by: total), maxLength: maxLength - total)
-            if length <= 0 {
-                break
-            }
-            total += length
-            totalBytesOut += Int64(length)
-            OSAtomicAdd64(-Int64(length), &queueBytesOut)
-        }
     }
 
     func close(isDisconnected: Bool) {
@@ -123,7 +95,8 @@ open class NetSocket: NSObject {
         totalBytesIn = 0
         totalBytesOut = 0
         queueBytesOut = 0
-        inputBuffer.removeAll(keepingCapacity: false)
+        inputBuffer.removeAll()
+        outputBuffer.removeAll()
 
         guard let inputStream: InputStream = inputStream, let outputStream: OutputStream = outputStream else {
             return
@@ -138,12 +111,13 @@ open class NetSocket: NSObject {
         outputStream.delegate = self
         outputStream.schedule(in: runloop!, forMode: .default)
         outputStream.setProperty(securityLevel.rawValue, forKey: .socketSecurityLevelKey)
+        CFWriteStreamSetDispatchQueue(outputStream, outputQueue)
 
         inputStream.open()
         outputStream.open()
 
         if 0 < timeout {
-            outputQueue.asyncAfter(deadline: .now() + .seconds(timeout), execute: timeoutHandler)
+            inputQueue.asyncAfter(deadline: .now() + .seconds(timeout), execute: timeoutHandler)
         }
 
         runloop?.run()
@@ -152,7 +126,6 @@ open class NetSocket: NSObject {
 
     func deinitConnection(isDisconnected: Bool) {
         timeoutHandler.cancel()
-        outputQueue = .init(label: "com.haishinkit.HaishinKit.NetSocket.output", qos: qualityOfService)
         inputStream?.close()
         inputStream?.remove(from: runloop!, forMode: .default)
         inputStream?.delegate = nil
@@ -166,15 +139,53 @@ open class NetSocket: NSObject {
     func didTimeout() {
     }
 
-    private func doInput() {
-        guard let inputStream: InputStream = inputStream else {
-            return
-        }
-        let length: Int = inputStream.read(&buffer, maxLength: windowSizeC)
-        if 0 < length {
+    private func doInput(_ inputStream: InputStream) {
+        let length = inputStream.read(&buffer, maxLength: windowSizeC)
+        switch length {
+        case -1:
+            close(isDisconnected: true)
+        case 0:
+            close(isDisconnected: true)
+        case 1...:
             totalBytesIn += Int64(length)
             inputBuffer.append(buffer, count: length)
             listen()
+        default:
+            break
+        }
+    }
+
+    private func doOutput(_ outputStream: OutputStream) {
+        while outputStream.hasSpaceAvailable && outputStream.streamStatus == .open && !outputBuffer.isEmpty {
+            guard let buffer = outputBuffer.first else {
+                break
+            }
+            buffer.data.withUnsafeBytes { (bytes: UnsafeRawBufferPointer) -> Void in
+                guard let bytes = bytes.baseAddress?.assumingMemoryBound(to: UInt8.self) else {
+                    return
+                }
+                var total = 0
+                let maxLength = buffer.data.count
+                while total < maxLength {
+                    let length = outputStream.write(bytes.advanced(by: total), maxLength: maxLength - total)
+                    switch length {
+                    case -1:
+                        close(isDisconnected: true)
+                    case 0:
+                        close(isDisconnected: true)
+                    case 1...:
+                        total += length
+                        totalBytesOut += Int64(length)
+                        OSAtomicAdd64(-Int64(length), &queueBytesOut)
+                        outputBuffer.removeFirst()
+                        if let locked = buffer.locked {
+                            OSAtomicAnd32Barrier(0, locked)
+                        }
+                    default:
+                        break
+                    }
+                }
+            }
         }
     }
 }
@@ -187,7 +198,7 @@ extension NetSocket: StreamDelegate {
         case .openCompleted:
             guard let inputStream = inputStream, let outputStream = outputStream,
                 inputStream.streamStatus == .open && outputStream.streamStatus == .open else {
-                    break
+                break
             }
             if aStream == inputStream {
                 timeoutHandler.cancel()
@@ -195,12 +206,14 @@ extension NetSocket: StreamDelegate {
             }
         //  2 = 1 << 1
         case .hasBytesAvailable:
-            if aStream == inputStream {
-                doInput()
+            if let aStream = aStream as? InputStream, aStream == inputStream {
+                doInput(aStream)
             }
         //  4 = 1 << 2
         case .hasSpaceAvailable:
-            break
+            if let aStream = aStream as? OutputStream, aStream == outputStream {
+                doOutput(aStream)
+            }
         //  8 = 1 << 3
         case .errorOccurred:
             guard aStream == inputStream else {
