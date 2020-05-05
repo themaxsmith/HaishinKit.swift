@@ -13,8 +13,8 @@ public protocol TSWriterDelegate: class {
 
 /// MPEG-2 TS (Transport Stream) Writer Foundation class
 public class TSWriter: Running {
-    public static let defaultPATPID: UInt16 = 0
-    public static let defaultPMTPID: UInt16 = 4095
+    public static let defaultPATPID: UInt16 = 1
+    public static let defaultPMTPID: UInt16 = 4096
     public static let defaultVideoPID: UInt16 = 256
     public static let defaultAudioPID: UInt16 = 257
 
